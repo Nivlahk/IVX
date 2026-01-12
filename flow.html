@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      background: #1e1e1e;
+      color: #ddd;
+      font-family: system-ui, sans-serif;
+      overflow: auto;
+    }
+    svg {
+      min-width: 100vw;
+      min-height: 100vh;
+      background: #1e1e1e;
+    }
+    text {
+      font-size: 11px;
+      fill: #eee;
+    }
+  </style>
+</head>
+<body>
+  <svg id="canvas"></svg>
+  <script>
+    const svgNS = "http://www.w3.org/2000/svg";
+    const BASEY = 40;
+    const YSTEP = 90;
+    const INDENTSTEP = 120;
+    const MAXNODEWIDTH = 260;
+    const PADDINGX = 20;
+    const PADDINGY = 10;
+    const LINEHEIGHT = 14;
+    let currentGraph = null;
+    let vscode = null;
+    let nodePositions = new Map();
+    let activeEdit = null;
+    const svg = document.getElementById("canvas");
+    if (svg) svg.addEventListener("click", onNodeClick);
+
+    function ensureVscode() {
+      if (!vscode && typeof acquireVsCodeApi === "function") {
+        vscode = acquireVsCodeApi();
+      }
+    }
+    function clearSvg() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+    }
+    function measureText(str) {
+      if (!str) return 0;
+      const tmp = document.createElementNS(svgNS, "text");
+      tmp.textContent = str;
+      tmp.setAttribute("font-size", "11px");
+      tmp.setAttribute("visibility", "hidden");
+      svg.appendChild(tmp);
+      const w = tmp.getComputedTextLength();
+      svg.removeChild(tmp);
+      return w;
+    }
+    function addTitle(el, meta) {
+      if (!meta) return;
+      const titleEl = document.createElementNS(svgNS, "title");
+      titleEl.textContent = meta;
+      el.appendChild(titleEl);
+    }
+    function createWrappedLabel(textContent, xCenter, yCenter, maxWidth, meta) {
+      const textEl = document.createElementNS(svgNS, "text");
+      textEl.setAttribute("text-anchor", "middle");
+      textEl.setAttribute("dominant-baseline", "middle");
+      addTitle(textEl, meta);
+      const words = textContent.toString().split(" ");
+      const lines = [];
+      let currentLine = "";
+
+      for (const word of words) {
+        const testLine = currentLine ? currentLine + " " + word : word;
+        if (measureText(testLine) > maxWidth && currentLine) {
+          lines.push(currentLine);
+          currentLine = word;
+        } else {
+          currentLine = testLine;
+        }
+      }
+      if (currentLine) lines.push(currentLine);
+
+      const totalHeight = LINEHEIGHT * lines.length;
+      const startY = yCenter - totalHeight / 2 + LINEHEIGHT / 2;
+
+      lines.forEach((line, i) => {
+        const tspan = document.createElementNS(svgNS, "tspan");
+        tspan.setAttribute("x", String(xCenter));
+        tspan.setAttribute("y", String(startY + i * LINEHEIGHT));
+        tspan.textContent = line;
+        textEl.appendChild(tspan);
+      });
+      svg.appendChild(textEl);
+      const bbox = textEl.getBBox();
+      return { textEl, bbox };
+    }
+    function computeEdgeAnchors(fromPos, toPos) {
+      return {
+        x1: fromPos.centerX,
+        y1: fromPos.centerY + fromPos.height / 2,
+        x2: toPos.centerX,
+        y2: toPos.centerY - toPos.height / 2,
+      };
+    }
+    function drawCurvedEdge(x1, y1, x2, y2, label) {
+      const midX = (x1 + x2) / 2;
+      const midY = (y1 + y2) / 2;
+      const curveOffset = 0.3 * (x2 - x1);
+      const cpX = midX + curveOffset;
+      const cpY = midY;
+      const path = document.createElementNS(svgNS, "path");
+      path.setAttribute("d", `M ${x1} ${y1} Q ${cpX} ${cpY} ${x2} ${y2}`);
+      path.setAttribute("fill", "none");
+      path.setAttribute("stroke", "#aaaaaa");
+      path.setAttribute("stroke-width", "1.5");
+      svg.appendChild(path);
+      const angle = Math.atan2(y2 - cpY, x2 - cpX);
+      const arrowSize = 6;
+      const ax = x2;
+      const ay = y2;
+      const p1x = ax - arrowSize * Math.cos(angle - Math.PI / 6);
+      const p1y = ay - arrowSize * Math.sin(angle - Math.PI / 6);
+      const p2x = ax - arrowSize * Math.cos(angle + Math.PI / 6);
+      const p2y = ay - arrowSize * Math.sin(angle + Math.PI / 6);
+      const arrow = document.createElementNS(svgNS, "polygon");
+      arrow.setAttribute("points", `${ax},${ay} ${p1x},${p1y} ${p2x},${p2y}`);
+      arrow.setAttribute("fill", "#aaaaaa");
+      svg.appendChild(arrow);
+
+      if (label) {
+        const text = document.createElementNS(svgNS, "text");
+        text.setAttribute("x", String(midX));
+        text.setAttribute("y", String(midY - 5));
+        text.setAttribute("text-anchor", "middle");
+        text.textContent = label;
+        svg.appendChild(text);
+      }
+    }
+    function propagateAttribute(targetMap, parentsByTo, condition) {
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const [nodeId, parents] of parentsByTo.entries()) {
+          if (targetMap.has(nodeId) || parents.length !== 1) continue;
+          const parentId = parents[0].from;
+          if (!targetMap.has(parentId)) continue;
+          const parentVal = targetMap.get(parentId);
+          const newVal = condition(nodeId, parentId, parentVal);
+          if (newVal !== undefined) {
+            targetMap.set(nodeId, newVal);
+            changed = true;
+          }
+        }
+      }
+    }
+    function isForwardEdge(fromNode, toNode) {
+      if (toNode.line > fromNode.line) return true;
+      if (toNode.line < fromNode.line) return false;
+      return toNode.segmentIndex >= fromNode.segmentIndex;
+    }
+    function buildAdjacency(graph) {
+      const byId = new Map(graph.nodes.map(n => [n.id, n]));
+      const childrenByFrom = new Map();
+      const parentsByTo = new Map();
+
+      for (const e of graph.edges) {
+        if (!childrenByFrom.has(e.from)) childrenByFrom.set(e.from, []);
+        childrenByFrom.get(e.from).push(e);
+        if (!parentsByTo.has(e.to)) parentsByTo.set(e.to, []);
+        parentsByTo.get(e.to).push(e);
+      }
+      return { byId, childrenByFrom, parentsByTo };
+    }
+    function computeBranchInfo(graph, byId, childrenByFrom, parentsByTo) {
+      const branchIndex = new Map();
+      for (const node of graph.nodes) {
+        if (node.kind !== "Decision") continue;
+        const childEdges = (childrenByFrom.get(node.id) || []).slice();
+        if (!childEdges.length) continue;
+        childEdges.sort((a, b) => {
+          const na = byId.get(a.to);
+          const nb = byId.get(b.to);
+          if (!na || !nb) return a.to - b.to;
+          if (na.line !== nb.line) return na.line - nb.line;
+          if (na.segmentIndex !== nb.segmentIndex) return na.segmentIndex - nb.segmentIndex;
+          return na.id - nb.id;
+        });
+        childEdges.forEach((edge, idx) => {
+          branchIndex.set(edge.to, idx);
+        });
+      }
+      propagateAttribute(
+        branchIndex,
+        parentsByTo,
+        (nodeId, parentId, parentVal) => {
+          const parents = parentsByTo.get(nodeId);
+          if (!parents || parents.length !== 1) return undefined;
+          return parentVal;
+        }
+      );
+      const decisionOf = new Map();
+      for (const node of graph.nodes) {
+        if (node.kind !== "Decision") continue;
+        const childEdges = childrenByFrom.get(node.id) || [];
+        for (const e of childEdges) {
+          if (branchIndex.has(e.to)) decisionOf.set(e.to, node.id);
+        }
+      }
+      propagateAttribute(
+        decisionOf,
+        parentsByTo,
+        (nodeId, parentId, parentVal) => {
+          const parents = parentsByTo.get(nodeId);
+          if (!parents || parents.length !== 1) return undefined;
+          return parentVal;
+        }
+      );
+      const branchDepth = new Map();
+      for (const node of graph.nodes) {
+        if (!branchIndex.has(node.id)) continue;
+        const decId = decisionOf.get(node.id);
+        if (!decId) continue;
+        const parents = parentsByTo.get(node.id) || [];
+        const isDirectChild = parents.some(e => e.from === decId);
+        if (isDirectChild) branchDepth.set(node.id, 0);
+      }
+      propagateAttribute(
+        branchDepth,
+        parentsByTo,
+        (nodeId, parentId, parentVal) => {
+          if (!branchIndex.has(nodeId)) return undefined;
+          if (decisionOf.get(nodeId) !== decisionOf.get(parentId)) return undefined;
+          return parentVal + 1;
+        }
+      );
+      return { branchIndex, decisionOf, branchDepth };
+    }
+    function computeLayering(graph, byId) {
+      const nodeLayout = new Map();
+      for (const node of graph.nodes) {
+        nodeLayout.set(node.id, { depth: node.kind === "Start" ? 0 : Infinity });
+      }
+      const layeringEdges = graph.edges.filter(e => {
+        const fromNode = byId.get(e.from);
+        const toNode = byId.get(e.to);
+        return fromNode && toNode && isForwardEdge(fromNode, toNode);
+      });
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const e of layeringEdges) {
+          const fromLayout = nodeLayout.get(e.from);
+          const toLayout = nodeLayout.get(e.to);
+          if (!fromLayout || !toLayout) continue;
+          const fromDepth = fromLayout.depth;
+          const toDepth = toLayout.depth;
+          if (fromDepth + 1 < toDepth) {
+            toLayout.depth = fromDepth + 1;
+            changed = true;
+          }
+        }
+      }
+      return nodeLayout;
+    }
+    function computeBasePositions(graph, nodeLayout) {
+      const positions = new Map();
+      const centerXBase = (svg.clientWidth || window.innerWidth) / 2;
+
+      for (const node of graph.nodes) {
+        const layout = nodeLayout.get(node.id);
+        const depth = layout && isFinite(layout.depth) ? layout.depth : 0;
+        const centerX = centerXBase;
+        const centerY = BASEY + depth * YSTEP;
+        positions.set(node.id, {
+          id: node.id,
+          kind: node.kind,
+          centerX,
+          centerY,
+          x: centerX,
+          y: centerY,
+          width: 0,
+          height: 0,
+        });
+      }
+      return { positions, centerXBase };
+    }
+    function computeBranchOffsets(graph, branchIndex, decisionOf, positions, centerXBase, childrenByFrom, parentsByTo) {
+      const branchesPerDecision = new Map();
+      for (const node of graph.nodes) {
+        if (node.kind === "Decision") branchesPerDecision.set(node.id, new Set());
+      }
+      for (const [nodeId, idx] of branchIndex.entries()) {
+        const decId = decisionOf.get(nodeId);
+        if (decId != null) {
+          const set = branchesPerDecision.get(decId);
+          if (set) set.add(idx);
+        }
+      }
+      for (const [nodeId, idx] of branchIndex.entries()) {
+        const decId = decisionOf.get(nodeId);
+        if (decId == null) continue;
+        const pos = positions.get(nodeId);
+        if (!pos) continue;
+        const branchSet = branchesPerDecision.get(decId);
+        if (!branchSet || !branchSet.size) continue;
+        const maxBranchIndex = Math.max(...branchSet);
+        const n = maxBranchIndex + 1;
+        const spacing = INDENTSTEP;
+        let slot;
+        if (n % 2 === 1) {
+          const mid = (n - 1) / 2;
+          slot = idx - mid;
+        } else {
+          const midRight = n / 2;
+          slot = idx - midRight + 0.5;
+        }
+        const offset = slot * spacing;
+        const x = centerXBase + offset;
+        pos.centerX = x;
+        pos.x = x - pos.width / 2;
+      }
+      for (const node of graph.nodes) {
+        if (node.kind !== "Connector" && node.kind !== "NextConnector") continue;
+        const pos = positions.get(node.id);
+        if (!pos) continue;
+        const parents = parentsByTo.get(node.id) || [];
+        if (!parents.length) continue;
+        const decIds = new Set();
+        parents.forEach(e => {
+          const d = decisionOf.get(e.from);
+          if (d != null) decIds.add(d);
+        });
+        if (decIds.size !== 1) continue;
+        let minX = Infinity, maxX = -Infinity;
+        parents.forEach(e => {
+          const parentPos = positions.get(e.from);
+          if (!parentPos) return;
+          if (parentPos.centerX < minX) minX = parentPos.centerX;
+          if (parentPos.centerX > maxX) maxX = parentPos.centerX;
+        });
+        const centerX = isFinite(minX) && isFinite(maxX) ? (minX + maxX) / 2 : centerXBase;
+        pos.centerX = centerX;
+        pos.x = centerX - pos.width / 2;
+      }
+    }
+    function computeLayout(graph) {
+      const { byId, childrenByFrom, parentsByTo } = buildAdjacency(graph);
+      const { branchIndex, decisionOf } = computeBranchInfo(graph, byId, childrenByFrom, parentsByTo);
+      const nodeLayout = computeLayering(graph, byId);
+      const { positions, centerXBase } = computeBasePositions(graph, nodeLayout);
+      computeBranchOffsets(graph, branchIndex, decisionOf, positions, centerXBase, childrenByFrom, parentsByTo);
+      nodePositions = positions;
+      return { positions, parentsByTo, branchIndex, decisionOf };
+    }
+    function computeHiddenIds(graph) {
+      const hiddenIds = new Set();
+      const collapsedFunHeaders = [];
+
+      for (const node of graph.nodes) {
+        if (!node.meta) continue;
+        if (!node.meta.includes("fun-block collapsed")) continue;
+        const match = node.meta.match(/fun-body=\[([^\]]*)\]/);
+        if (!match) continue;
+        const ids = match[1]
+          .split(",")
+          .map(s => parseInt(s.trim(), 10))
+          .filter(Number.isFinite);
+        ids.forEach(id => hiddenIds.add(id));
+        collapsedFunHeaders.push(node.id);
+      }
+      if (collapsedFunHeaders.length) {
+        for (const node of graph.nodes) {
+          if (!node.meta) continue;
+          for (const headerId of collapsedFunHeaders) {
+            if (
+              node.meta.includes(`fun-body-of=${headerId}`) ||
+              node.meta.includes(`fun-footer-of=${headerId}`)
+            ) {
+              hiddenIds.add(node.id);
+              break;
+            }
+          }
+        }
+      }
+      return { hiddenIds, collapsedFunHeaders };
+    }
+    function makeNodeShape(node, centerX, centerY, nodeWidth, nodeHeight, x, y) {
+      if (node.kind === "Start" || node.kind === "End") {
+        const shape = document.createElementNS(svgNS, "ellipse");
+        shape.setAttribute("cx", String(centerX));
+        shape.setAttribute("cy", String(centerY));
+        shape.setAttribute("rx", String(nodeWidth / 2));
+        shape.setAttribute("ry", String(nodeHeight / 2));
+        return shape;
+      }
+      if (node.kind === "Decision") {
+        const shape = document.createElementNS(svgNS, "polygon");
+        const halfW = nodeWidth / 2;
+        const halfH = nodeHeight / 2;
+        const points = [
+          [centerX, centerY - halfH],
+          [centerX + halfW, centerY],
+          [centerX, centerY + halfH],
+          [centerX - halfW, centerY],
+        ].map(p => p.join(",")).join(" ");
+        shape.setAttribute("points", points);
+        return shape;
+      }
+      if (node.kind === "Input" || node.kind === "Output") {
+        const shape = document.createElementNS(svgNS, "polygon");
+        const halfW = nodeWidth / 2;
+        const halfH = nodeHeight / 2;
+        const slantX = halfW * 0.25;
+        const points = [
+          [centerX - halfW, centerY - halfH],
+          [centerX + halfW - slantX, centerY - halfH],
+          [centerX + halfW, centerY + halfH],
+          [centerX - halfW + slantX, centerY + halfH],
+        ].map(p => p.join(",")).join(" ");
+        shape.setAttribute("points", points);
+        return shape;
+      }
+      const shape = document.createElementNS(svgNS, "rect");
+      shape.setAttribute("x", String(x));
+      shape.setAttribute("y", String(y));
+      shape.setAttribute("width", String(nodeWidth));
+      shape.setAttribute("height", String(nodeHeight));
+      shape.setAttribute("rx", "4");
+      shape.setAttribute("ry", "4");
+      return shape;
+    }
+    function renderNodes(graph, positions, hiddenIds) {
+      const funFooterOf = new Map();
+      for (const node of graph.nodes) {
+        if (!node.meta) continue;
+        const m = node.meta.match(/fun-footer-of=(\d+)/);
+        if (m) funFooterOf.set(parseInt(m[1], 10), node.id);
+      }
+      for (const node of graph.nodes) {
+        if (hiddenIds.has(node.id)) continue;
+        const pos = positions.get(node.id);
+        if (!pos) continue;
+        const { centerX, centerY } = pos;
+
+        if (node.kind === "Connector" || node.kind === "NextConnector") {
+          const radius = 6;
+          const shape = document.createElementNS(svgNS, "circle");
+          shape.setAttribute("cx", String(centerX));
+          shape.setAttribute("cy", String(centerY));
+          shape.setAttribute("r", String(radius));
+          shape.setAttribute("fill", node.kind === "Connector" ? "#bbbbbb" : "#00bfff");
+          shape.setAttribute("stroke", "#cccccc");
+          shape.setAttribute("stroke-width", "1.5");
+          addTitle(shape, node.meta);
+          svg.appendChild(shape);
+
+          pos.x = centerX - radius;
+          pos.y = centerY - radius;
+          pos.width = radius * 2;
+          pos.height = radius * 2;
+          continue;
+        }
+        const rawText = node.text.trim();
+        const isFunBlock = node.kind === "Process" && rawText.startsWith("fun");
+        const isInlineElse = node.kind === "Process" && rawText.startsWith("else");
+        const labelCore = isInlineElse
+          ? rawText.substring(5).trim()
+          : isFunBlock
+          ? rawText.replace(/^fun!?/, "").trim()
+          : rawText;
+        const labelText = labelCore || node.kind;
+        const { textEl, bbox } = createWrappedLabel(
+          labelText,
+          centerX,
+          centerY,
+          MAXNODEWIDTH - PADDINGX * 2,
+          node.meta
+        );
+        const nodeWidth = Math.max(bbox.width + PADDINGX * 2, 60);
+        const nodeHeight = Math.max(bbox.height + PADDINGY * 2, 30);
+        const x = centerX - nodeWidth / 2;
+        const y = centerY - nodeHeight / 2;
+        const shape = makeNodeShape(node, centerX, centerY, nodeWidth, nodeHeight, x, y);
+
+        const fill =
+          node.kind === "Decision"
+            ? "#004b8d"
+            : node.kind === "Predictive"
+            ? "#6a00a3"
+            : node.kind === "Start"
+            ? "#007f00"
+            : node.kind === "End"
+            ? "#7f0000"
+            : node.kind === "Input"
+            ? "#007f00"
+            : node.kind === "Output"
+            ? "#ED8936"
+            : isFunBlock
+            ? "#5b3fbf"
+            : "#333333";
+        shape.setAttribute("fill", fill);
+        shape.setAttribute("stroke", "#cccccc");
+        shape.setAttribute("stroke-width", "1.5");
+
+        const nodeIdStr = String(node.id);
+        shape.dataset.nodeId = nodeIdStr;
+        textEl.dataset.nodeId = nodeIdStr;
+        shape.style.cursor = "text";
+        textEl.style.cursor = "text";
+        addTitle(shape, node.meta);
+        svg.insertBefore(shape, textEl);
+        pos.x = x;
+        pos.y = y;
+        pos.width = nodeWidth;
+        pos.height = nodeHeight;
+      }
+      return funFooterOf;
+    }
+    function computeCollapsedFunEdges(graph, hiddenIds, collapsedFunHeaders, funFooterOf) {
+      const collapsedFunEdges = [];
+      const footerIds = new Set(funFooterOf.values());
+      footerIds.size; // keep var use
+
+      for (const headerId of collapsedFunHeaders) {
+        const footerId = funFooterOf.get(headerId);
+        if (!footerId) continue;
+        for (const e of graph.edges) {
+          if (e.from !== footerId) continue;
+          const succId = e.to;
+          if (hiddenIds.has(succId)) continue;
+          collapsedFunEdges.push({ from: headerId, to: succId, label: e.label });
+        }
+      }
+      return collapsedFunEdges;
+    }
+    function renderEdges(graph, positions, hiddenIds, extraEdges = []) {
+      for (const e of graph.edges) {
+        if (hiddenIds.has(e.from) || hiddenIds.has(e.to)) continue;
+        const fromPos = positions.get(e.from);
+        const toPos = positions.get(e.to);
+        if (!fromPos || !toPos) continue;
+        const { x1, y1, x2, y2 } = computeEdgeAnchors(fromPos, toPos);
+        drawCurvedEdge(x1, y1, x2, y2, e.label);
+      }
+      for (const e of extraEdges) {
+        const fromPos = positions.get(e.from);
+        const toPos = positions.get(e.to);
+        if (!fromPos || !toPos) continue;
+        const { x1, y1, x2, y2 } = computeEdgeAnchors(fromPos, toPos);
+        drawCurvedEdge(x1, y1, x2, y2, e.label);
+      }
+    }
+    function fitSvgToContent() {
+      const bbox = svg.getBBox();
+      const extra = 80;
+      const contentMinX = bbox.x - extra;
+      const contentMinY = bbox.y - extra;
+      const contentWidth = bbox.width + extra * 2;
+      const contentHeight = bbox.height + extra * 2;
+      svg.setAttribute("viewBox", `${contentMinX} ${contentMinY} ${contentWidth} ${contentHeight}`);
+      svg.setAttribute("width", String(Math.max(contentWidth, window.innerWidth)));
+      svg.setAttribute("height", String(Math.max(contentHeight, window.innerHeight)));
+    }
+    function renderGraph(graph) {
+      currentGraph = graph;
+      clearSvg();
+      const { positions } = computeLayout(graph);
+      nodePositions = positions;
+      const { hiddenIds, collapsedFunHeaders } = computeHiddenIds(graph);
+      const funFooterOf = renderNodes(graph, positions, hiddenIds);
+      const collapsedFunEdges = computeCollapsedFunEdges(graph, hiddenIds, collapsedFunHeaders, funFooterOf);
+      renderEdges(graph, positions, hiddenIds, collapsedFunEdges);
+      fitSvgToContent();
+    }
+    function onNodeClick(ev) {
+      if (!currentGraph) return;
+      let el = ev.target;
+      while (el && el !== svg) {
+        let nodeIdAttr = null;
+        if (el.dataset && el.dataset.nodeId != null) {
+          nodeIdAttr = el.dataset.nodeId;
+        } else if (typeof el.getAttribute === "function") {
+          nodeIdAttr = el.getAttribute("data-node-id");
+        }
+        if (nodeIdAttr != null) {
+          const nodeId = parseInt(nodeIdAttr, 10);
+          const node = currentGraph.nodes.find(n => n.id === nodeId);
+          if (!node) return;
+          const pos = nodePositions.get(nodeId);
+          if (!pos) return;
+          ensureVscode();
+          if (!vscode) return;
+          vscode.postMessage({
+            type: "requestNodeEdit",
+            nodeId,
+            line: node.line,
+            segmentIndex: node.segmentIndex,
+            x: pos.x,
+            y: pos.y,
+            width: pos.width,
+            height: pos.height,
+          });
+          return;
+        }
+        el = el.parentNode;
+      }
+    }
+    function startNodeEdit(msg) {
+      const { nodeId, text, x, y, width, height, line, segmentIndex } = msg;
+
+      if (activeEdit && activeEdit.parentNode) {
+        svg.removeChild(activeEdit);
+      }
+      const fo = document.createElementNS(svgNS, "foreignObject");
+      fo.setAttribute("x", String(x));
+      fo.setAttribute("y", String(y));
+      fo.setAttribute("width", String(width));
+      fo.setAttribute("height", String(height + 10));
+      const div = document.createElement("div");
+      div.setAttribute("xmlns", "http://www.w3.org/1999/xhtml");
+      Object.assign(div.style, {
+        width: "100%",
+        height: "100%",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+      });
+      const input = document.createElement("input");
+      input.type = "text";
+      input.value = text;
+      input.style.width = "95%";
+      input.addEventListener("keydown", e => {
+        if (e.key === "Enter") {
+          ensureVscode();
+          if (vscode) {
+            vscode.postMessage({
+              type: "commitNodeEdit",
+              nodeId,
+              newText: input.value,
+              line,
+              segmentIndex,
+            });
+          }
+          svg.removeChild(fo);
+          activeEdit = null;
+        } else if (e.key === "Escape") {
+          svg.removeChild(fo);
+          activeEdit = null;
+        }
+      });
+      div.appendChild(input);
+      fo.appendChild(div);
+      svg.appendChild(fo);
+      activeEdit = fo;
+      input.focus();
+      input.select();
+    }
+    window.addEventListener("message", event => {
+      const msg = event.data;
+      if (!msg) return;
+      if (msg.type === "graph") {
+        renderGraph(msg.graph);
+      } else if (msg.type === "startNodeEdit") {
+        startNodeEdit(msg);
+      }
+    });
+  </script>
+</body>
+</html>

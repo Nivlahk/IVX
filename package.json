@@ -1,0 +1,89 @@
+{
+  "name": "lahk",
+  "displayName": "Lahk",
+  "description": "testing",
+  "version": "0.0.1",
+  "publisher": "your-publisher-id",
+  "engines": {
+    "vscode": "^1.107.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "extensionKind": ["workspace"],
+
+  "activationEvents": [
+    "onLanguage:lahk",
+    "onCommand:lahk.dumpGraph",
+    "onCommand:lahk.showGraph",
+    "onCommand:lahk.toggleRealtimeGraph"
+  ],
+"contributes": {
+  "textMateRules": [
+    {
+      "scope": "comment.block.lahk",
+      "settings": { "foreground": "#00FF00" }
+    },
+    {
+      "scope": "keyword.control.node.lahk",
+      "settings": { "foreground": "#C586C0" }
+    },
+    {
+      "scope": "keyword.specifier.lahk",
+      "settings": { "foreground": "#569CD6" }
+    },
+    {
+      "scope": "string.lahk",
+      "settings": { "foreground": "#569CD6" }
+    }
+  ],
+    "languages": [
+      {
+        "id": "lahk",
+        "extensions": [".ivx"],
+        "aliases": ["Lahk", "ivx"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "lahk",
+        "scopeName": "source.lahk",
+        "path": "./lahk.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "lahk.dumpGraph",
+        "title": "Lahk: Dump Graph"
+      },
+      {
+        "command": "lahk.showGraph",
+        "title": "Lahk: Show Graph"
+      },
+      {
+        "command": "lahk.toggleRealtimeGraph",
+        "title": "Lahk: Toggle Realtime Graph"
+      }
+    ]
+  },
+
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "npm run clean && npm run lint && tsc -p ./tsconfig.json",
+    "watch": "tsc -p ./tsconfig.json -w",
+    "clean": "rimraf dist",
+    "lint": "eslint src",
+    "test": "echo \"no tests yet\""
+  },
+
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "@types/vscode": "^1.107.0",
+    "eslint": "^9.39.1",
+    "rimraf": "^6.1.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.48.1"
+  }
+}

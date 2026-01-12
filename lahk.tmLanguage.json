@@ -1,0 +1,27 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Lahk",
+  "scopeName": "source.lahk",
+  "patterns": [
+  {
+    "match": "(?:^|(?<=\\s))#([^:\\\\n]*)",
+    "name": "comment.line.hash.lahk",
+    "captures": {
+      "1": { "name": "comment.line.hash.lahk punctuation.definition.comment" }
+    }
+  },
+  {
+    "match": "\\b(end|ii|dec|im|ex|fun)\\b",
+    "name": "keyword.control.node.lahk"
+  },
+  {
+    "match": "\\b(then|else|next|loop)\\b",
+    "name": "keyword.specifier.lahk"
+  },
+  {
+    "name": "string.lahk",
+    "begin": "\"",
+    "end": "\""
+  }
+]
+}
